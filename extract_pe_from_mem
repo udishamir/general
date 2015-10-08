@@ -1,0 +1,35 @@
+ NOVEMBER 29, 2011 BY MARK MORGAN
+
+One of the questions I initially had when I started analyzing memory images with Volatility was how do I extract the malicious executable from memory that the RE guys will be able to analyze. I kept running into the problem of not getting all the API functions with the executable and the RE guys kept telling me they could not do a complete analysis since they did not have all the functions.
+
+So I picked up the book “Malware Analyst’s Cookbook and DVD” because there are 4 chapters dedicated to Volatility and one of those chapters (Chapter 16, Recipe 16-7) specifically deals with extracting the executable along with the API functions. So the following is a summarized excerpt of that recipe for those of you who do not have the above referenced book. This discussion will assume the reader has installed the latest version of Volatility from http://volatility.googlecode.com and installed all the available plugins and dependencies required. There are excellent walk-thru’s on the volatility website for that.
+
+In general, to rebuild an executable from memory, you need to parse the PE section headers to learn the addresses and sizes of the PE sections. Then, you can carve out the appropriate amount of data from memory and re-combine the sections into a file on disk according to their original positions. There are references that provide a much deeper understanding of this process and are listed as follows:
+
+http://computer.forensikblog.de/en/2006/04/reconstructing_a_binary.html (Andreas Schuster)
+
+http://windowsir.blogspot.com/2006/07/automatic-binary-reassembly-from-ram.html (Harlan Carvey)
+
+http://jessekornblum.com/presentation/dodcc07.html (Jesse Kornblum)
+
+The methods described in the above publications rely on information in the PE header and do not attempt to reconstruct the Import Address Table (IAT). Malware samples that erase the entire PE header, relocate the IAT, or that use run-time dynamic linking cause significant problems. You still will be able to dump the binary using the base address and size information from the PE header (if it exists) or the base address and size information from the VAD; however, you will not be able to tell which API functions the malware calls. The following excerpt will explain methods to work around these anti-analysis techniques based on scanning the process address space for API calls, without relying on data in the IAT.
+
+The first step is to use pslist or psscan to generate list of processes. Once you know the PID or _EPROCESS offset for the process that you want to dump, then you can pass it to procexedump or simply the leave off the -p parameter to dump all the processes. The syntax would be as follows:
+
+python volatility.py pslist -f laqma.vmem (whatever the name of your memory image is) -p PID number
+
+I would suggest at this point you download your favorite PE viewer and if you do not have one then I would suggest downloading CFF Explorer. Once you have dumped your process out then open it up using CFF Explorer and see if the IAT contains the right information. If it is a legitimate file it probably will but if not it will probably be missing the imported function names. At this point, you cold load the dumped file in IDA Pro and try your best to determine its capabilities without IAT information. Or you could scan the file with multiple anti-virus engines to see if they detect anything in the unpacked process image. However, what you typically want to do is perform a more thorough reverse-engineering tasks, which requires information about the imported functions.
+
+Scanning For Imported Functions with IMPSCAN
+
+The reason you should be concerned with an incomplete IAT is that it will hinder your ability to perform a thorough code analysis. If you try to examine the instructions in the dumped file using IDA Pro, then you will see placeholders instead of API calls. Since IDA does not have access to the entire process’s memory, it cannot determine what APIs exist at those addresses in order to label them. The impscan plug-in for Volatility aims to solve the problem of incomplete import tables. It is very unlikely that the dumped program will match the original or even execute on another machine. That is fine because all you really need to complete a thorough analysis of the malware’s capabilities is to be able to see which API functions it is calling in the disassembly. Therefore, impscan does not attempt to produce a patched version of the dumped file as Import REConstructor does for live systems. Instead, it simply provides labels that you can import into IDA Pro. Below is the syntax for impscan to scan a process for imported functions:
+
+python volatility.py impscan -p 920 -f laqma.vmem –dump-dir=outdir
+
+impscan works by determining the base address and size of all DLLs in a process. Using pefile, it parses the Export Address Table (EAT) of the DLLs to determine the offsets and names of exported functions. Then, using pydasm, it scans the process executable (or any memory range in the process address space as specified with the -a and -s flags) looking for call or jmp instructions. If the destination of one of the call or jmp instructions leads to an API, them impscan records the address of the instruction and the corresponding API function name. Impscan produces MakeName statements, which you can transfer into IDA Pro. These statements contain the missing information that IDA needs to link the placeholders presented earlier with the name of the API function stored at that address.
+
+To apply the labels, click File → IDC Command, paste in the MakeName statements, and click OK. Once you have clicked OK, you will immediately see changes applied throughout the program. You can get even more information out of IDA by choosing to re-analyze the program. Now that IDA can tell which API functions the program is calling, IDA can label arguments accordingly. To do this, Click Options → General → Analysis → Reanalyze Program. Once this is complete then you can save your work through IDA Pro and then give that file to your RE guys for a detailed analysis. This will make their life a little easier and they will be much more receptive in handling executables from memory.
+
+This process will create two files (bin file and a bin.idc) so if you are not an RE guy then you can take these two files along with the executable and give those to your RE guys who will know how to import them into IDA.
+
+The impscan is not part of the volatility install but is a python script found on the DVD of the above referenced book.  I have uploaded this script to the library for everyone’s use.  The file is called “malware.py” and contains numerous scripts in one and the impscan script is part of that.  
