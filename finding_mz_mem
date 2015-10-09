@@ -1,0 +1,547 @@
+Working with malware can be both fun and extremely frustrating. I think the two go hand in hand. One common method of obfuscating a binary is packing. Packing generally comprises of a decoder stub that takes seemingly innocuous binary data, and produces assembly instructions runnable by the computer. This is done at runtime so that we cannot reverse engineer the executable statically.
+
+When the malware runs and starts to unpack itself it oftens allocates a new region of memory for the new code. Once everything has been decoded execution is transfered to the new region of memory containing the proper assembly instruction.
+
+In other cases the initial piece of malware may "drop" a replica, or alternate form of itself that will run again on reboot. Usually the original is removed and the user is unaware of what is really being executed.
+
+In both situations we can use a simple trick to find this new executable in memory. If the process expects to write a new image out or create a new process using a newly unpacked, or written executable it must have a PE header. Herein lies our trick, finding any PE files in a processes memory space that WinDbg is unaware of.
+
+As a side note, packed executables may not create a image header after it is unpacked. It may simply unpack itself each time it is executed. In those cases the executable simply switches execution to the unpacked region. In such cases this specific trick will not work.
+
+Lets look at a normal executable first, so we can understand what we will be searching for. When listing modules in WinDbg we can easily see anything that WinDbg has loaded, because it keeps a list of modules.
+0:001> lm
+start    end        module name
+01000000 0101f000   calc       (deferred)             
+5ad70000 5ada8000   UxTheme    (deferred)             
+74720000 7476c000   MSCTF      (deferred)             
+755c0000 755ee000   msctfime   (deferred)             
+76390000 763ad000   IMM32      (deferred)             
+77120000 771ab000   OLEAUT32   (deferred)             
+773d0000 774d3000   comctl32   (deferred)             
+774e0000 7761d000   ole32      (deferred)             
+77b40000 77b62000   apphelp    (deferred)             
+77c10000 77c68000   msvcrt     (deferred)             
+77dd0000 77e6b000   ADVAPI32   (deferred)             
+77e70000 77f02000   RPCRT4     (deferred)             
+77f10000 77f59000   GDI32      (deferred)             
+77f60000 77fd6000   SHLWAPI    (deferred)             
+77fe0000 77ff1000   Secur32    (deferred)             
+7c800000 7c8f6000   kernel32   (deferred)             
+7c900000 7c9af000   ntdll      (pdb symbols)
+7c9c0000 7d1d7000   SHELL32    (deferred)             
+7e410000 7e4a1000   USER32     (deferred)             
+
+Unloaded modules:
+5cb70000 5cb96000   ShimEng.dll
+77c00000 77c08000   version.dll
+Simple enough. This list shows our main executable image "calc" and libraries it has loaded. Let's take this one step further and do the searching ourselves. This is how we will later detect modules in memory that may be malicious.
+0:001> s -d 0x0 L?0xffffffff 0x00905a4d
+01000000  00905a4d 00000003 00000004 0000ffff  MZ..............
+5ad70000  00905a4d 00000003 00000004 0000ffff  MZ..............
+74720000  00905a4d 00000003 00000004 0000ffff  MZ..............
+755c0000  00905a4d 00000003 00000004 0000ffff  MZ..............
+76390000  00905a4d 00000003 00000004 0000ffff  MZ..............
+77120000  00905a4d 00000003 00000004 0000ffff  MZ..............
+773d0000  00905a4d 00000003 00000004 0000ffff  MZ..............
+774e0000  00905a4d 00000003 00000004 0000ffff  MZ..............
+77b40000  00905a4d 00000003 00000004 0000ffff  MZ..............
+77c10000  00905a4d 00000003 00000004 0000ffff  MZ..............
+77dd0000  00905a4d 00000003 00000004 0000ffff  MZ..............
+77e70000  00905a4d 00000003 00000004 0000ffff  MZ..............
+77f10000  00905a4d 00000003 00000004 0000ffff  MZ..............
+77f60000  00905a4d 00000003 00000004 0000ffff  MZ..............
+77fe0000  00905a4d 00000003 00000004 0000ffff  MZ..............
+7c800000  00905a4d 00000003 00000004 0000ffff  MZ..............
+7c900000  00905a4d 00000003 00000004 0000ffff  MZ..............
+7c9c0000  00905a4d 00000003 00000004 0000ffff  MZ..............
+7e410000  00905a4d 00000003 00000004 0000ffff  MZ..............
+
+The "s" command is very powerful allowing you to search not only dword sized bytes, but ascii/unicode strings, and any other data type you can imagine. The dword we are searching for in our example is the "magic" 2 bytes of a PE file and its header offset. In my experience these provide a unique identifier for executable images. Just to be fair the "magic" is actually the magic of the predecessor MZ DOS file format, and is used for the ms-dos executable stub in every PE file. Little known fact, the MZ stands for Mark Zbikowski, the creator of the DOS executable file format.
+
+Lets verify the results from our seach using the "!lmi" command.
+0:001> !lmi 01000000  
+Loaded Module Info: [01000000] 
+         Module: calc
+   Base Address: 01000000
+     Image Name: C:\windows\system32\calc.exe
+   Machine Type: 332 (I386)
+     Time Stamp: 3b7d8410 Fri Aug 17 15:52:32 2001
+           Size: 1f000
+       CheckSum: 1d7fc
+Characteristics: 10f  
+Debug Data Dirs: Type  Size     VA  Pointer
+             CODEVIEW    19,  160c,     a0c NB10 - Sig: 3b7d8410, Age: 1, Pdb: calc.pdb
+    Symbol Type: DEFERRED - No error - symbol load deferred
+    Load Report: no symbols loaded
+Alright, we have a decent way to search for executables. Lets fine tune this using the "1" flag to "s", and the ".foreach" command. In the help file for search we see the following about the "1" flag.
+
+"1 - Displays only the addresses of search matches in the search output. This option is useful if you are using the .foreach token to pipe the command output into another command's input. "
+
+Here is the new output.
+0:001> s -[1]d 0x0 L?0xffffffff 0x00905a4d
+0x01000000
+0x5ad70000
+0x74720000
+0x755c0000
+0x76390000
+0x77120000
+0x773d0000
+0x774e0000
+0x77b40000
+0x77c10000
+0x77dd0000
+0x77e70000
+0x77f10000
+0x77f60000
+0x77fe0000
+0x7c800000
+0x7c900000
+0x7c9c0000
+0x7e410000
+
+Now we can feed this to the very handy scripting command ".foreach", which as you can imagine loops through the input tokens and runs another command on each of them. For this example we will use "!lmi" like we did previously to get a listing of each module in our binary.
+0:001> .foreach ( header {s -[1]d 0x0 L?0xffffffff 0x00905a4d} ) {.echo "****HEADER****";!lmi header}
+****HEADER****
+Loaded Module Info: [0x01000000] 
+         Module: calc
+   Base Address: 01000000
+     Image Name: C:\windows\system32\calc.exe
+   Machine Type: 332 (I386)
+     Time Stamp: 3b7d8410 Fri Aug 17 15:52:32 2001
+           Size: 1f000
+       CheckSum: 1d7fc
+Characteristics: 10f  
+Debug Data Dirs: Type  Size     VA  Pointer
+             CODEVIEW    19,  160c,     a0c NB10 - Sig: 3b7d8410, Age: 1, Pdb: calc.pdb
+    Symbol Type: DEFERRED - No error - symbol load deferred
+    Load Report: no symbols loaded
+****HEADER****
+Loaded Module Info: [0x5ad70000] 
+         Module: UxTheme
+   Base Address: 5ad70000
+     Image Name: C:\WINDOWS\system32\UxTheme.dll
+   Machine Type: 332 (I386)
+     Time Stamp: 4802a11e Sun Apr 13 19:11:10 2008
+           Size: 38000
+       CheckSum: 4533d
+Characteristics: 210e  
+Debug Data Dirs: Type  Size     VA  Pointer
+             CODEVIEW    24, 300fc,   2f4fc RSDS - GUID: {E99E1630-8F09-4767-B1F0-7FB5C3E5E246}
+               Age: 2, Pdb: uxtheme.pdb
+                CLSID     4, 300f8,   2f4f8 [Data not mapped]
+    Symbol Type: DEFERRED - No error - symbol load deferred
+    Load Report: no symbols loaded
+****HEADER****
+Loaded Module Info: [0x74720000] 
+         Module: MSCTF
+   Base Address: 74720000
+     Image Name: C:\WINDOWS\system32\MSCTF.dll
+   Machine Type: 332 (I386)
+     Time Stamp: 4802a12c Sun Apr 13 19:11:24 2008
+           Size: 4c000
+       CheckSum: 492ef
+Characteristics: 210e  
+Debug Data Dirs: Type  Size     VA  Pointer
+             CODEVIEW    22, 427dc,   41bdc RSDS - GUID: {C52F0B4C-00E9-4556-AE99-9F228B001966}
+               Age: 2, Pdb: msctf.pdb
+                CLSID     4, 427d8,   41bd8 [Data not mapped]
+    Symbol Type: DEFERRED - No error - symbol load deferred
+    Load Report: no symbols loaded
+****HEADER****
+Loaded Module Info: [0x755c0000] 
+         Module: msctfime
+   Base Address: 755c0000
+     Image Name: C:\WINDOWS\system32\msctfime.ime
+   Machine Type: 332 (I386)
+     Time Stamp: 4802a12d Sun Apr 13 19:11:25 2008
+           Size: 2e000
+       CheckSum: 2d2b7
+Characteristics: 210e  
+Debug Data Dirs: Type  Size     VA  Pointer
+             CODEVIEW    25,  4398,    3798 RSDS - GUID: {60228888-3AF4-4453-9793-69233E091E64}
+               Age: 1, Pdb: msctfime.pdb
+    Symbol Type: DEFERRED - No error - symbol load deferred
+    Load Report: no symbols loaded
+****HEADER****
+Loaded Module Info: [0x76390000] 
+         Module: IMM32
+   Base Address: 76390000
+     Image Name: C:\WINDOWS\system32\IMM32.DLL
+   Machine Type: 332 (I386)
+     Time Stamp: 4802a0e7 Sun Apr 13 19:10:15 2008
+           Size: 1d000
+       CheckSum: 2921b
+Characteristics: 210e  
+Debug Data Dirs: Type  Size     VA  Pointer
+             CODEVIEW    22, 15a74,   14e74 RSDS - GUID: {F7A5B5DB-1332-4153-B57A-AF340C77EA51}
+               Age: 2, Pdb: imm32.pdb
+                CLSID     4, 15a70,   14e70 [Data not mapped]
+    Symbol Type: DEFERRED - No error - symbol load deferred
+    Load Report: no symbols loaded
+****HEADER****
+Loaded Module Info: [0x77120000] 
+         Module: OLEAUT32
+   Base Address: 77120000
+     Image Name: C:\WINDOWS\system32\OLEAUT32.DLL
+   Machine Type: 332 (I386)
+     Time Stamp: 4802a112 Sun Apr 13 19:10:58 2008
+           Size: 8b000
+       CheckSum: 8d4e3
+Characteristics: 210e  
+Debug Data Dirs: Type  Size     VA  Pointer
+             CODEVIEW    25, 7f970,   7ed70 RSDS - GUID: {F2A20900-9B69-4EFC-AD1A-6CE9D992EBC1}
+               Age: 2, Pdb: oleaut32.pdb
+                CLSID     4, 7f96c,   7ed6c [Data not mapped]
+    Symbol Type: DEFERRED - No error - symbol load deferred
+    Load Report: no symbols loaded
+****HEADER****
+Loaded Module Info: [0x773d0000] 
+         Module: comctl32
+   Base Address: 773d0000
+     Image Name: C:\WINDOWS\WinSxS\x86_Microsoft.Windows.Common-Controls_6595b64144ccf1df_6.0.2600.5512_x-ww_35d4ce83\comctl32.dll
+   Machine Type: 332 (I386)
+     Time Stamp: 4802a094 Sun Apr 13 19:08:52 2008
+           Size: 103000
+       CheckSum: 10324b
+Characteristics: 210e  
+Debug Data Dirs: Type  Size     VA  Pointer
+             CODEVIEW    53,  3eb8,    32b8 RSDS - GUID: {50505797-1C40-416F-B39F-ED1D39BED057}
+               Age: 1, Pdb: MicrosoftWindowsCommon-Controls-6.0.2600.5512-comctl32.pdb
+    Symbol Type: DEFERRED - No error - symbol load deferred
+    Load Report: no symbols loaded
+****HEADER****
+Loaded Module Info: [0x774e0000] 
+         Module: ole32
+   Base Address: 774e0000
+     Image Name: C:\WINDOWS\system32\ole32.dll
+   Machine Type: 332 (I386)
+     Time Stamp: 4802a111 Sun Apr 13 19:10:57 2008
+           Size: 13d000
+       CheckSum: 14744b
+Characteristics: 210e  
+Debug Data Dirs: Type  Size     VA  Pointer
+             CODEVIEW    22, 11ff3c,  11f33c RSDS - GUID: {ED517599-D2C1-4CF1-9200-861833059C14}
+               Age: 2, Pdb: ole32.pdb
+                CLSID     4, 11ff38,  11f338 [Data not mapped]
+    Symbol Type: DEFERRED - No error - symbol load deferred
+    Load Report: no symbols loaded
+****HEADER****
+Loaded Module Info: [0x77b40000] 
+         Module: apphelp
+   Base Address: 77b40000
+     Image Name: C:\WINDOWS\system32\apphelp.dll
+   Machine Type: 332 (I386)
+     Time Stamp: 4802a0bf Sun Apr 13 19:09:35 2008
+           Size: 22000
+       CheckSum: 29aea
+Characteristics: 210e  
+Debug Data Dirs: Type  Size     VA  Pointer
+             CODEVIEW    24, 1d5a8,   1c9a8 RSDS - GUID: {67A8FA70-E1A7-4574-8157-14DA307E21BB}
+               Age: 2, Pdb: apphelp.pdb
+                CLSID     4, 1d5a4,   1c9a4 [Data not mapped]
+    Symbol Type: DEFERRED - No error - symbol load deferred
+    Load Report: no symbols loaded
+****HEADER****
+Loaded Module Info: [0x77c10000] 
+         Module: msvcrt
+   Base Address: 77c10000
+     Image Name: C:\WINDOWS\system32\msvcrt.dll
+   Machine Type: 332 (I386)
+     Time Stamp: 4802a188 Sun Apr 13 19:12:56 2008
+           Size: 58000
+       CheckSum: 57341
+Characteristics: 210e  
+Debug Data Dirs: Type  Size     VA  Pointer
+             CODEVIEW    23,  b828,    ac28 RSDS - GUID: {7BCF30D8-C91B-4F1B-85FA-4E5589625011}
+               Age: 1, Pdb: msvcrt.pdb
+    Symbol Type: DEFERRED - No error - symbol load deferred
+    Load Report: no symbols loaded
+****HEADER****
+Loaded Module Info: [0x77dd0000] 
+         Module: ADVAPI32
+   Base Address: 77dd0000
+     Image Name: C:\WINDOWS\system32\ADVAPI32.dll
+   Machine Type: 332 (I386)
+     Time Stamp: 4802a0b2 Sun Apr 13 19:09:22 2008
+           Size: 9b000
+       CheckSum: 9b625
+Characteristics: 210e  
+Debug Data Dirs: Type  Size     VA  Pointer
+             CODEVIEW    25, 75514,   74914 RSDS - GUID: {5EFB9BF4-2CC6-4024-AB64-802E46739464}
+               Age: 2, Pdb: advapi32.pdb
+                CLSID     4, 75510,   74910 [Data not mapped]
+    Symbol Type: DEFERRED - No error - symbol load deferred
+    Load Report: no symbols loaded
+****HEADER****
+Loaded Module Info: [0x77e70000] 
+         Module: RPCRT4
+   Base Address: 77e70000
+     Image Name: C:\WINDOWS\system32\RPCRT4.dll
+   Machine Type: 332 (I386)
+     Time Stamp: 4802a106 Sun Apr 13 19:10:46 2008
+           Size: 92000
+       CheckSum: 91932
+Characteristics: 210e  
+Debug Data Dirs: Type  Size     VA  Pointer
+             CODEVIEW    23, 83720,   82b20 RSDS - GUID: {CCD4FE9B-704E-48B6-B8A1-2F31E112AA6F}
+               Age: 2, Pdb: rpcrt4.pdb
+                CLSID     4, 8371c,   82b1c [Data not mapped]
+    Symbol Type: DEFERRED - No error - symbol load deferred
+    Load Report: no symbols loaded
+****HEADER****
+Loaded Module Info: [0x77f10000] 
+         Module: GDI32
+   Base Address: 77f10000
+     Image Name: C:\WINDOWS\system32\GDI32.dll
+   Machine Type: 332 (I386)
+     Time Stamp: 4802a0be Sun Apr 13 19:09:34 2008
+           Size: 49000
+       CheckSum: 472ff
+Characteristics: 210e  
+Debug Data Dirs: Type  Size     VA  Pointer
+             CODEVIEW    22, 43558,   42958 RSDS - GUID: {740F60A9-9F2A-417E-96C3-87400994588D}
+               Age: 2, Pdb: gdi32.pdb
+                CLSID     4, 43554,   42954 [Data not mapped]
+    Symbol Type: DEFERRED - No error - symbol load deferred
+    Load Report: no symbols loaded
+****HEADER****
+Loaded Module Info: [0x77f60000] 
+         Module: SHLWAPI
+   Base Address: 77f60000
+     Image Name: C:\WINDOWS\system32\SHLWAPI.dll
+   Machine Type: 332 (I386)
+     Time Stamp: 4802a116 Sun Apr 13 19:11:02 2008
+           Size: 76000
+       CheckSum: 8329f
+Characteristics: 210e  
+Debug Data Dirs: Type  Size     VA  Pointer
+             CODEVIEW    24, 6cb44,   6bf44 RSDS - GUID: {8519E340-3447-4788-84CF-FE7F1A91BAE0}
+               Age: 2, Pdb: shlwapi.pdb
+                CLSID     4, 6cb40,   6bf40 [Data not mapped]
+    Symbol Type: DEFERRED - No error - symbol load deferred
+    Load Report: no symbols loaded
+****HEADER****
+Loaded Module Info: [0x77fe0000] 
+         Module: Secur32
+   Base Address: 77fe0000
+     Image Name: C:\WINDOWS\system32\Secur32.dll
+   Machine Type: 332 (I386)
+     Time Stamp: 4802a11b Sun Apr 13 19:11:07 2008
+           Size: 11000
+       CheckSum: 117db
+Characteristics: 210e  
+Debug Data Dirs: Type  Size     VA  Pointer
+             CODEVIEW    24,  d1b8,    c5b8 RSDS - GUID: {E8D37874-0B8E-4A46-B19C-AFCD2D6DDF7D}
+               Age: 2, Pdb: secur32.pdb
+                CLSID     4,  d1b4,    c5b4 [Data not mapped]
+    Symbol Type: DEFERRED - No error - symbol load deferred
+    Load Report: no symbols loaded
+****HEADER****
+Loaded Module Info: [0x7c800000] 
+         Module: kernel32
+   Base Address: 7c800000
+     Image Name: C:\WINDOWS\system32\kernel32.dll
+   Machine Type: 332 (I386)
+     Time Stamp: 4802a12c Sun Apr 13 19:11:24 2008
+           Size: f6000
+       CheckSum: f44a2
+Characteristics: 210e  
+Debug Data Dirs: Type  Size     VA  Pointer
+             CODEVIEW    25, 840a4,   834a4 RSDS - GUID: {34560E80-F5C5-4175-B208-848EF863C5BD}
+               Age: 2, Pdb: kernel32.pdb
+                CLSID     4, 840a0,   834a0 [Data not mapped]
+    Symbol Type: DEFERRED - No error - symbol load deferred
+    Load Report: no symbols loaded
+****HEADER****
+Loaded Module Info: [0x7c900000] 
+         Module: ntdll
+   Base Address: 7c900000
+     Image Name: C:\WINDOWS\system32\ntdll.dll
+   Machine Type: 332 (I386)
+     Time Stamp: 4802a12c Sun Apr 13 19:11:24 2008
+           Size: af000
+       CheckSum: b62bc
+Characteristics: 210e  perf
+Debug Data Dirs: Type  Size     VA  Pointer
+             CODEVIEW    22, 7af94,   7a394 RSDS - GUID: {17510032-60CA-4259-8C0F-B326585000ED}
+               Age: 2, Pdb: ntdll.pdb
+                CLSID     4, 7af90,   7a390 [Data not mapped]
+     Image Type: FILE     - Image read successfully from debugger.
+                 C:\WINDOWS\system32\ntdll.dll
+    Symbol Type: PDB      - Symbols loaded successfully from symbol server.
+                 c:\windows\Symbols\ntdll.pdb\1751003260CA42598C0FB326585000ED2\ntdll.pdb
+    Load Report: public symbols , not source indexed 
+                 c:\windows\Symbols\ntdll.pdb\1751003260CA42598C0FB326585000ED2\ntdll.pdb
+****HEADER****
+Loaded Module Info: [0x7c9c0000] 
+         Module: SHELL32
+   Base Address: 7c9c0000
+     Image Name: C:\WINDOWS\system32\SHELL32.dll
+   Machine Type: 332 (I386)
+     Time Stamp: 4802a111 Sun Apr 13 19:10:57 2008
+           Size: 817000
+       CheckSum: 81ad5d
+Characteristics: 210e  
+Debug Data Dirs: Type  Size     VA  Pointer
+             CODEVIEW    24, 1fe8dc,  1fdcdc RSDS - GUID: {69B3829B-B688-4926-A5B9-7BF04E812C6B}
+               Age: 2, Pdb: shell32.pdb
+                CLSID     4, 1fe8d8,  1fdcd8 [Data not mapped]
+    Symbol Type: DEFERRED - No error - symbol load deferred
+    Load Report: no symbols loaded
+****HEADER****
+Loaded Module Info: [0x7e410000] 
+         Module: USER32
+   Base Address: 7e410000
+     Image Name: C:\WINDOWS\system32\USER32.dll
+   Machine Type: 332 (I386)
+     Time Stamp: 4802a11b Sun Apr 13 19:11:07 2008
+           Size: 91000
+       CheckSum: 8fc76
+Characteristics: 210e  
+Debug Data Dirs: Type  Size     VA  Pointer
+             CODEVIEW    23, 60260,   5f660 RSDS - GUID: {D18A41B7-4E7F-458C-AAAC-1847E2D8BF02}
+               Age: 2, Pdb: user32.pdb
+                CLSID     4, 6025c,   5f65c [Data not mapped]
+    Symbol Type: DEFERRED - No error - symbol load deferred
+    Load Report: no symbols loaded
+I know that is a lot of information. It's basically doing what we did, or could do, with "lm" but it proves we are dealing with executable images.
+
+Now, what if calc.exe had a payload, or had unpacked a new executable to run? For demonstration purposes, and so you can do this yourself without running an actual malicious image, we are going to fake it. The goal will be locating this new image and subsequently dumping it before it ever runs, or is written to disk.
+
+For our fake I will allocate memory in WinDbg and store the header from the original calc.exe in the newly created memory region.
+0:001> .dvalloc /b 41410000 1024
+Allocated 2000 bytes starting at 41410000
+
+0:001> dc 41410000
+41410000  00000000 00000000 00000000 00000000  ................
+41410010  00000000 00000000 00000000 00000000  ................
+41410020  00000000 00000000 00000000 00000000  ................
+41410030  00000000 00000000 00000000 00000000  ................
+41410040  00000000 00000000 00000000 00000000  ................
+41410050  00000000 00000000 00000000 00000000  ................
+41410060  00000000 00000000 00000000 00000000  ................
+41410070  00000000 00000000 00000000 00000000  ................
+
+0:001> .readmem "C:\\windows\\system32\\calc.exe" 41410000 41411024
+Reading 1025 bytes...
+
+0:001> dc 41410000
+41410000  00905a4d 00000003 00000004 0000ffff  MZ..............
+41410010  000000b8 00000000 00000040 00000000  ........@.......
+41410020  00000000 00000000 00000000 00000000  ................
+41410030  00000000 00000000 00000000 000000f0  ................
+41410040  0eba1f0e cd09b400 4c01b821 685421cd  ........!..L.!Th
+41410050  70207369 72676f72 63206d61 6f6e6e61  is program canno
+41410060  65622074 6e757220 206e6920 20534f44  t be run in DOS 
+41410070  65646f6d 0a0d0d2e 00000024 00000000  mode....$.......
+OK. Let's now list our modules and see what shows up.
+0:001> lm
+start    end        module name
+01000000 0101f000   calc       (pdb symbols)
+5ad70000 5ada8000   UxTheme    (pdb symbols)
+74720000 7476c000   MSCTF      (pdb symbols)
+755c0000 755ee000   msctfime   (pdb symbols)
+76390000 763ad000   IMM32      (pdb symbols)
+77120000 771ab000   OLEAUT32   (pdb symbols)
+773d0000 774d3000   comctl32   (pdb symbols)
+774e0000 7761d000   ole32      (pdb symbols)
+77b40000 77b62000   apphelp    (pdb symbols)
+77c10000 77c68000   msvcrt     (pdb symbols)
+77dd0000 77e6b000   ADVAPI32   (pdb symbols)
+77e70000 77f02000   RPCRT4     (pdb symbols)
+77f10000 77f59000   GDI32      (pdb symbols)
+77f60000 77fd6000   SHLWAPI    (pdb symbols)
+77fe0000 77ff1000   Secur32    (pdb symbols)
+7c800000 7c8f6000   kernel32   (pdb symbols)
+7c900000 7c9af000   ntdll      (pdb symbols)
+7c9c0000 7d1d7000   SHELL32    (pdb symbols)
+7e410000 7e4a1000   USER32     (pdb symbols)
+
+Unloaded modules:
+5cb70000 5cb96000   ShimEng.dll
+77c00000 77c08000   version.dll
+This looks the same is it did before right? This is because WinDBG (or any debugger) doesn't scan memory for executables, it keeps a list when loading. So let's search ourselves and see what we come up with.
+0:001> s -d 0x0 L?0xffffffff 0x00905a4d
+01000000  00905a4d 00000003 00000004 0000ffff  MZ..............
+41410000  00905a4d 00000003 00000004 0000ffff  MZ..............
+5ad70000  00905a4d 00000003 00000004 0000ffff  MZ..............
+74720000  00905a4d 00000003 00000004 0000ffff  MZ..............
+755c0000  00905a4d 00000003 00000004 0000ffff  MZ..............
+76390000  00905a4d 00000003 00000004 0000ffff  MZ..............
+77120000  00905a4d 00000003 00000004 0000ffff  MZ..............
+773d0000  00905a4d 00000003 00000004 0000ffff  MZ..............
+774e0000  00905a4d 00000003 00000004 0000ffff  MZ..............
+77b40000  00905a4d 00000003 00000004 0000ffff  MZ..............
+77c10000  00905a4d 00000003 00000004 0000ffff  MZ..............
+77dd0000  00905a4d 00000003 00000004 0000ffff  MZ..............
+77e70000  00905a4d 00000003 00000004 0000ffff  MZ..............
+77f10000  00905a4d 00000003 00000004 0000ffff  MZ..............
+77f60000  00905a4d 00000003 00000004 0000ffff  MZ..............
+77fe0000  00905a4d 00000003 00000004 0000ffff  MZ..............
+7c800000  00905a4d 00000003 00000004 0000ffff  MZ..............
+7c900000  00905a4d 00000003 00000004 0000ffff  MZ..............
+7c9c0000  00905a4d 00000003 00000004 0000ffff  MZ..............
+7e410000  00905a4d 00000003 00000004 0000ffff  MZ..............
+Oh no, who's that guy at 0x41410000?
+0:001> .foreach ( header {s -[1]d 0x0 L?0xffffffff 0x00905a4d} ) {!lmi header;.echo "****HEADER****"}
+Loaded Module Info: [0x01000000] 
+         Module: calc
+   Base Address: 01000000
+     Image Name: C:\windows\system32\calc.exe
+   Machine Type: 332 (I386)
+     Time Stamp: 3b7d8410 Fri Aug 17 15:52:32 2001
+           Size: 1f000
+       CheckSum: 1d7fc
+Characteristics: 10f  
+Debug Data Dirs: Type  Size     VA  Pointer
+             CODEVIEW    19,  160c,     a0c NB10 - Sig: 3b7d8410, Age: 1, Pdb: calc.pdb
+     Image Type: FILE     - Image read successfully from debugger.
+                 C:\work\Blogs\re\11_06_2008\calc_virus.exe
+    Symbol Type: PDB      - Symbols loaded successfully from symbol server.
+                 c:\windows\Symbols\calc.pdb\3B7D84101\calc.pdb
+    Load Report: public symbols , not source indexed 
+                 c:\windows\Symbols\calc.pdb\3B7D84101\calc.pdb
+****HEADER****
+Loaded Module Info: [0x41410000] 
+41410000 is not a valid address
+...
+Here, WinDbg does not have any information on this executable. Again it didn't load it so it is impossible to know. We are again going to do things manually so that we can see the size of this binary for output.
+
+The PE file format has a member in the IMAGE_OPTIONAL_HEADER structure named dwSizeOfImage. This value gives us the size of the image *loaded into memory*. This dword value is at offset 0x140 from the beginning of the PE file which can easily be inspect using WinDbg.
+0:001> dc 41410000+140 L1
+41410140  0001f000
+And some gratiuitous WinDbg action.
+0:001> .formats 0001f000
+Evaluate expression:
+  Hex:     0001f000
+  Decimal: 126976
+  Octal:   00000370000
+  Binary:  00000000 00000001 11110000 00000000
+  Chars:   ....
+  Time:    Fri Jan 02 05:16:16 1970
+  Float:   low 1.77931e-040 high 0
+  Double:  6.27345e-319
+So we need to write out 126976 bytes from the location we found in our search. Lets do that. First I will set up the example to include the whole binary.
+0:001> .dvalloc /b 41410000 1f000
+Allocated 1f000 bytes starting at 41410000
+0:001> .readmem "C:\\windows\\system32\\calc.exe" 41410000 41410000+1f000
+Reading 1f001 bytes........................................................
+Unable to read data for 4142c000, load is incomplete
+Whoops! Something happened. It's because the size on disk is different than the SizeOfImage, which is the size of the image loaded into memory rounded up to the next page. Minor inconvenience though, WinDbg still loads everything it can.
+0:001> dc 4142b000
+4142b000  006d0069 006c0061 00460009 00000036  i.m.a.l...F.6...
+4142b010  01340000 004f0026 00740063 006c0061  ..4.&.O.c.t.a.l.
+4142b020  00460009 00000037 01350000 00420026  ..F.7.....5.&.B.
+4142b030  006e0069 00720061 00090079 00380046  i.n.a.r.y...F.8.
+4142b040  00000000 00000000 013a0000 00260044  ..........:.D.&.
+4142b050  00670065 00650072 00730065 00460009  e.g.r.e.e.s...F.
+4142b060  00000032 013b0000 00520026 00640061  2.....;.&.R.a.d.
+4142b070  00610069 0073006e 00460009 00000033  i.a.n.s...F.3...
+So here we have a full image loaded, let's just write this new unidentified executable to disk.
+:001> .writemem "C:\\windows\\system32\\calc_dump.exe" 41410000 4142f000
+Writing 1f001 bytes..............................................................
+Unable to read memory at 4142f000, file is incomplete
+Again minor inconvenience. The image will be dumped to disk as it would have been written, or executed, by the malicious piece of code. Try and disassemble the dumped image, you will see everything looks perfect.
+
+There you have it, a handy trick to find executables that may be hidden in an executable. I hope you can use this at some point to dump out unpacked, or executable images you may encounter.
+
